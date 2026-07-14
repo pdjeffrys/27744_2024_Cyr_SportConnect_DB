@@ -1,4 +1,5 @@
 PHASE IV: DATABASE CREATION 
+
  1. Create a server-level SQL Server Login matching your exact naming convention
 -- Format: StudentID_FirstName_Project_DB
 CREATE LOGIN [27744_2024_Cyr_SportConnect_DB] 
@@ -92,7 +93,9 @@ CREATE TABLE system_audit_trail (
     terminal_info VARCHAR(255) DEFAULT HOST_NAME()
 );
 GO
+
 PHASE V: TABLE IMPLEMENTATION 
+
 -- Drop tables if they already exist to ensure clean re-deployment execution
 IF OBJECT_ID('system_audit_trail', 'U') IS NOT NULL DROP TABLE system_audit_trail;
 IF OBJECT_ID('bookings', 'U') IS NOT NULL DROP TABLE bookings;
@@ -197,6 +200,159 @@ INSERT INTO customers VALUES (501, 'Alain', 'Mugisha', 'alain.m@domain.rw', '+25
 INSERT INTO coaches VALUES (901, 'Jean_Paul', 'Ndayisaba', 'Tennis', 15000.00, 'ACTIVE'),
                            (902, 'Sandrine', 'Umubyeyi', 'Swimming', 12000.00, 'ACTIVE');
 GO
+
 PHASE VI: PL/SQL PROGRAMMING 
 
+-- Scalar Function to compute rates automatically
+CREATE FUNCTION dbo.fn_calculate_booking_cost(
+    @p_customer_id INT,
+    @p_zone_id INT,
+    @p_coach_id INT,
+    @p_duration_hours DECIMAL(5,2)
+)
+RETURNS DECIMAL(10,2)
+AS
+BEGIN
+    DECLARE @v_base_rate DECIMAL(10,2);
+    DECLARE @v_coach_rate DECIMAL(10,2) = 0;
+    DECLARE @v_discount_pct DECIMAL(5,2);
+    DECLARE @v_final_cost DECIMAL(10,2);
+
+    SELECT @v_base_rate = base_hourly_rate FROM sport_zones WHERE zone_id = @p_zone_id;
+    
+    IF @p_coach_id IS NOT NULL
+        SELECT @v_coach_rate = hourly_rate FROM coaches WHERE coach_id = @p_coach_id;
+        
+    SELECT @v_discount_pct = mt.discount_pct 
+    FROM customers c 
+    JOIN membership_tiers mt ON c.tier_id = mt.tier_id
+    WHERE c.customer_id = @p_customer_id;
+
+    SET @v_final_cost = ((@v_base_rate + @v_coach_rate) * @p_duration_hours);
+    SET @v_final_cost = @v_final_cost - (@v_final_cost * (@v_discount_pct / 100.00));
+
+    RETURN @v_final_cost;
+END;
+GO
+
+-- Transaction-safe Booking Assignment Stored Procedure
+CREATE PROCEDURE dbo.sp_create_reservation
+    @p_customer_id INT,
+    @p_zone_id INT,
+    @p_coach_id INT,
+    @p_start_time DATETIME,
+    @p_end_time DATETIME
+AS
+BEGIN
+    SET NOCOUNT ON;
+    
+    DECLARE @v_conflict_count INT;
+    DECLARE @v_duration_hours DECIMAL(5,2);
+    DECLARE @v_total_calculated_cost DECIMAL(10,2);
+    DECLARE @v_next_id INT;
+
+    -- Time sequence logic handling
+    IF @p_end_time <= @p_start_time
+    BEGIN
+        RAISERROR('End timestamp must be strictly after start timestamp.', 16, 1);
+        RETURN;
+    END
+
+    -- Check for timeline conflicts (Simulates Oracle Cursor Check)
+    SELECT @v_conflict_count = COUNT(*) 
+    FROM bookings 
+    WHERE zone_id = @p_zone_id
+      AND payment_status != 'CANCELLED'
+      AND (@p_start_time < end_time AND @p_end_time > start_time);
+
+    IF @v_conflict_count > 0
+    BEGIN
+        RAISERROR('Resource allocation failure: Selected Sport Zone is occupied for this timeline.', 16, 1);
+        RETURN;
+    END
+
+    -- Compute clean duration metric
+    SET @v_duration_hours = DATEDIFF(MINUTE, @p_start_time, @p_end_time) / 60.0;
+    
+    -- Call our cost tracking function
+    SET @v_total_calculated_cost = dbo.fn_calculate_booking_cost(@p_customer_id, @p_zone_id, @p_coach_id, @v_duration_hours);
+    
+    -- Derive next non-identity dynamic Primary Key
+    SELECT @v_next_id = ISNULL(MAX(booking_id), 0) + 1 FROM bookings;
+
+    -- Core Transaction Wrap Block
+    BEGIN TRANSACTION;
+    BEGIN TRY
+        INSERT INTO bookings (booking_id, customer_id, zone_id, coach_id, booking_date, start_time, end_time, total_cost, payment_status)
+        VALUES (@v_next_id, @p_customer_id, @p_zone_id, @p_coach_id, GETDATE(), @p_start_time, @p_end_time, @v_total_calculated_cost, 'PENDING');
+        
+        COMMIT TRANSACTION;
+    END TRY
+    BEGIN CATCH
+        ROLLBACK TRANSACTION;
+        THROW;
+    END CATCH
+END;
+GO
+
 PHASE VII: ADVANCED DATABASE PROGRAMMING
+
+-- 1. Security Trigger Block (Blocks Weekday & Holiday Alterations)
+CREATE TRIGGER trg_secure_dml_governance
+ON bookings
+INSTEAD OF INSERT, UPDATE, DELETE
+AS
+BEGIN
+    DECLARE @v_holiday_match INT;
+    DECLARE @v_day_of_week INT;
+
+    -- SQL Server DATEPART (1 = Sunday, 2 = Monday... 6 = Friday, 7 = Saturday)
+    SET @v_day_of_week = DATEPART(WEEKDAY, GETDATE());
+
+    SELECT @v_holiday_match = COUNT(*) 
+    FROM holiday_reference 
+    WHERE CAST(holiday_date AS DATE) = CAST(GETDATE() AS DATE);
+
+    IF (@v_holiday_match > 0) OR (@v_v_day_of_week BETWEEN 2 AND 6)
+    BEGIN
+        RAISERROR('Security Error: Data transactional mutations on Bookings are highly controlled during normal operating weekdays and registered holidays.', 16, 1);
+        ROLLBACK TRANSACTION;
+        RETURN;
+    END
+END;
+GO
+
+-- 2. Security Audit Trail Capture Trigger
+CREATE TRIGGER trg_audit_bookings_activity
+ON bookings
+AFTER INSERT, UPDATE, DELETE
+AS
+BEGIN
+    SET NOCOUNT ON;
+    DECLARE @v_action VARCHAR(10);
+
+    IF EXISTS (SELECT * FROM inserted) AND EXISTS (SELECT * FROM deleted)
+        SET @v_action = 'UPDATE';
+    ELSE IF EXISTS (SELECT * FROM inserted)
+        SET @v_action = 'INSERT';
+    ELSE
+        SET @v_action = 'DELETE';
+
+    INSERT INTO system_audit_trail (action_type, target_table)
+    VALUES (@v_action, 'BOOKINGS');
+END;
+GO
+
+-- 3. Phase V.2 Innovation Data Feed Reporting View 
+CREATE VIEW vw_analytics_revenue_efficiency AS
+SELECT 
+    sz.zone_name,
+    sz.sport_type,
+    SUM(b.total_cost) AS total_gross_revenue,
+    COUNT(b.booking_id) AS total_slots_booked,
+    AVG(DATEDIFF(MINUTE, b.start_time, b.end_time) / 60.0) AS average_utilization_hours
+FROM sport_zones sz
+LEFT JOIN bookings b ON sz.zone_id = b.zone_id
+WHERE b.payment_status IN ('COMPLETED', 'PENDING')
+GROUP BY sz.zone_name, sz.sport_type;
+GO
